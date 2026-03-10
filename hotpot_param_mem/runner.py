@@ -20,8 +20,13 @@ from .llm_vllm import AdapterRef, VLLMConfig, VLLMEngine
 from .logger import JsonlLogger, read_jsonl, summarize, write_summary
 from .mem_injector_ntp import MemConfig, MemInjectorNTP
 from .metrics import em_f1
-from .parsing import parse_first_action
-from .prompts import build_state_prompt, make_step0_query
+from .parsing import parse_first_action, parse_final_answer
+from .prompts import (
+    build_compression_prompt,
+    build_final_answer_prompt,
+    build_state_prompt,
+    make_step0_query,
+)
 
 
 @dataclass
@@ -132,7 +137,6 @@ class InferenceClient:
         return text if isinstance(text, str) else str(text)
 
     def shutdown(self):
-        # no-op for client mode
         return
 
 
@@ -508,7 +512,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
             gold = ex.get("answer", "")
             context = ex.get("context", [])
 
-            history = []
+            history: List[Tuple[str, str]] = []
             used_queries = set()
 
             forced_terminate = False
@@ -529,6 +533,8 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                     action_type = "search"
                     query = sanitize_query(make_step0_query(question))
                     raw = "[forced_step0_search]"
+                    info_block = ""
+                    paras = []
                 else:
                     prompt = build_state_prompt(question, history)
                     raw = gen_backend.generate(
@@ -536,30 +542,41 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                         max_tokens=64,
                         temperature=0.0,
                         adapter=adapter_ref,
-                        stop=["</search>", "</answer>"],
+                        stop=["</search>", "<finish/>", "</finish>"],
                     )
 
                     raw = (raw or "").strip()
                     if raw.startswith("<search>") and not raw.endswith("</search>"):
                         raw += "</search>"
-                    elif raw.startswith("<answer>") and not raw.endswith("</answer>"):
-                        raw += "</answer>"
 
                     parsed = parse_first_action(raw)
                     action_type = parsed.action_type
                     forced_terminate = forced_terminate or parsed.forced_terminate
 
-                    if action_type not in ("search", "answer"):
-                        action_type = "search"
-                        query = sanitize_query(make_step0_query(question))
-                    elif action_type == "answer":
-                        pred = (parsed.content or "").strip() or "unknown"
+                    if action_type == "finish":
+                        answer_prompt = build_final_answer_prompt(question, history)
+                        answer_raw = gen_backend.generate(
+                            answer_prompt,
+                            max_tokens=64,
+                            temperature=0.0,
+                            adapter=adapter_ref,
+                            stop=["</answer>"],
+                        )
+                        answer_raw = (answer_raw or "").strip()
+                        if answer_raw.startswith("<answer>") and not answer_raw.endswith("</answer>"):
+                            answer_raw += "</answer>"
+
+                        answer_parsed = parse_final_answer(answer_raw)
+                        pred = (answer_parsed.content or "").strip() or "unknown"
+                        forced_terminate = forced_terminate or answer_parsed.forced_terminate
+
                         trace_logger.write(
                             {
                                 "episode_id": episode_id,
                                 "step_id": step_id,
                                 "raw_model_output": raw,
-                                "action_type": "answer",
+                                "final_answer_raw_model_output": answer_raw,
+                                "action_type": "finish",
                                 "search_query": None,
                                 "information": None,
                                 "snippet": None,
@@ -575,8 +592,15 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                             }
                         )
                         break
+
+                    if action_type != "search":
+                        action_type = "search"
+                        query = sanitize_query(make_step0_query(question))
                     else:
                         query = sanitize_query(parsed.content)
+
+                    info_block = ""
+                    paras = []
 
                 if action_type == "search":
                     if len(query) < 3:
@@ -592,8 +616,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                         paras = []
                         info_block = (
                             "[System Warning: You have already searched this exact query. "
-                            "No new information found. You MUST output <answer> in your next turn "
-                            "based on what you already know.]"
+                            "No new information found. You should finish soon based on existing evidence.]"
                         )
                     else:
                         paras, info_block = retrieve_local(
@@ -611,7 +634,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                 mem_loss = None
                 t_update = 0.0
 
-                if injector is not None:
+                if injector is not None and action_type == "search":
                     tu = time.time()
                     snippet = injector.compress_snippet(
                         gen_backend,
