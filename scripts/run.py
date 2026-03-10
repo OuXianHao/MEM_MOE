@@ -2,20 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import random
 import sys
 from pathlib import Path
 
-import numpy as np
-import torch
-
 REPO_ROOT = Path(__file__).resolve().parents[1]  # ~/MEM3
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-
-from hotpot_param_mem.config import RunConfig
-from hotpot_param_mem.data import load_hotpot_examples
-from hotpot_param_mem.multiproc import run_multiproc
 
 
 def _str2bool(v):
@@ -94,15 +88,25 @@ def parse_args():
 
 def set_seed(seed: int):
     random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+
+    if importlib.util.find_spec("numpy") is not None:
+        np = __import__("numpy")
+        np.random.seed(seed)
+
+    if importlib.util.find_spec("torch") is not None:
+        torch = __import__("torch")
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
 
 if __name__ == "__main__":
     args = parse_args()
     set_seed(args.seed)
+
+    from hotpot_param_mem.config import RunConfig
+    from hotpot_param_mem.data import load_hotpot_examples
+    from hotpot_param_mem.multiproc import run_multiproc
 
     cfg = RunConfig(
         # ---- core io ----
