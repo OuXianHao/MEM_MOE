@@ -1,12 +1,6 @@
 from __future__ import annotations
 
-import json
-import os
-import shutil
-import tempfile
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -16,18 +10,17 @@ import torch.distributed as dist
 
 from .config import RunConfig
 from .env_local import retrieve_local
-from .llm_vllm import AdapterRef, VLLMConfig, VLLMEngine
 from .logger import JsonlLogger, read_jsonl, summarize, write_summary
-from .mem_injector_ntp import MemConfig, MemInjectorNTP
 from .metrics import em_f1
-from .parsing import parse_first_action, parse_final_answer
-from .prompts import (
-    build_compression_prompt,
-    build_final_answer_prompt,
-    build_state_prompt,
-    make_step0_query,
+from .parsing import parse_final_answer, parse_first_action
+from .prompts import make_step0_query
+from .services import (
+    AdapterRuntime,
+    build_generation_service,
+    build_memory_service,
+    finalize_dist,
+    maybe_init_dist,
 )
-
 
 @dataclass
 class WorkerContext:
@@ -38,170 +31,52 @@ class WorkerContext:
     dist_init_file: str = ""
 
 
-class InferenceClient:
-    """
-    Thin HTTP client for centralized inference.
+@dataclass
+class StepTraceRecord:
+    episode_id: str
+    step_id: int
+    raw_model_output: str
+    action_type: str
+    search_query: Optional[str]
+    information: Optional[str]
+    snippet: Optional[str]
+    mem_updated: bool
+    mem_loss: Optional[float]
+    time_gen: float
+    time_update: float
+    forced_terminate: bool
+    global_round: int
+    local_version_id: int
+    adapter_path: Optional[str]
+    inference_mode: str
+    final_answer_raw_model_output: Optional[str] = None
 
-    Expected server API:
-      POST /generate
-      request json:
-        {
-          "prompt": str,
-          "max_tokens": int,
-          "temperature": float,
-          "stop": List[str] | null,
-          "adapter": {
-              "name": str,
-              "int_id": int,
-              "path": str
-          } | null
+    def to_dict(self) -> Dict:
+        d = {
+            "episode_id": self.episode_id,
+            "step_id": self.step_id,
+            "raw_model_output": self.raw_model_output,
+            "action_type": self.action_type,
+            "search_query": self.search_query,
+            "information": self.information,
+            "snippet": self.snippet,
+            "mem_updated": self.mem_updated,
+            "mem_loss": self.mem_loss,
+            "time_gen": self.time_gen,
+            "time_update": self.time_update,
+            "forced_terminate": self.forced_terminate,
+            "global_round": self.global_round,
+            "local_version_id": self.local_version_id,
+            "adapter_path": self.adapter_path,
+            "inference_mode": self.inference_mode,
         }
-
-      response json:
-        {
-          "text": str
-        }
-    """
-
-    def __init__(self, host: str, port: int, timeout: int = 600):
-        self.host = host
-        self.port = int(port)
-        self.timeout = int(timeout)
-        self.base_url = f"http://{host}:{port}"
-
-    @staticmethod
-    def _coerce_adapter(
-        adapter: Optional[AdapterRef],
-        lora_name: Optional[str],
-        lora_int_id: Optional[int],
-        lora_path: Optional[str],
-    ) -> Optional[AdapterRef]:
-        if adapter is not None:
-            return adapter
-        if lora_name is None or lora_int_id is None or lora_path is None:
-            return None
-        return AdapterRef(name=str(lora_name), int_id=int(lora_int_id), path=str(lora_path))
-
-    def generate(
-        self,
-        prompt: str,
-        max_tokens: int = 64,
-        lora_name: Optional[str] = None,
-        lora_int_id: Optional[int] = None,
-        lora_path: Optional[str] = None,
-        adapter: Optional[AdapterRef] = None,
-        temperature: Optional[float] = None,
-        stop: Optional[List[str]] = None,
-    ) -> str:
-        adapter = self._coerce_adapter(adapter, lora_name, lora_int_id, lora_path)
-
-        payload = {
-            "prompt": prompt,
-            "max_tokens": int(max_tokens),
-            "temperature": 0.0 if temperature is None else float(temperature),
-            "stop": stop,
-            "adapter": None
-            if adapter is None
-            else {
-                "name": adapter.name,
-                "int_id": adapter.int_id,
-                "path": adapter.path,
-            },
-        }
-
-        req = urllib.request.Request(
-            url=f"{self.base_url}/generate",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                body = resp.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            detail = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-            raise RuntimeError(f"Inference server HTTPError: {e.code} {detail}") from e
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"Cannot reach inference server at {self.base_url}. "
-                f"Make sure the centralized inference service is running."
-            ) from e
-
-        try:
-            obj = json.loads(body)
-        except Exception as e:
-            raise RuntimeError(f"Inference server returned non-JSON response: {body[:300]}") from e
-
-        text = obj.get("text", "")
-        return text if isinstance(text, str) else str(text)
-
-    def shutdown(self):
-        return
+        if self.final_answer_raw_model_output is not None:
+            d["final_answer_raw_model_output"] = self.final_answer_raw_model_output
+        return d
 
 
 def _episode_key(ex: Dict) -> str:
     return str(ex.get("episode_id") or ex.get("_id") or ex.get("id") or "")
-
-
-def _parse_round_num(path: Path, prefix: str) -> Optional[int]:
-    if not path.name.startswith(prefix):
-        return None
-    tail = path.name[len(prefix):]
-    return int(tail) if tail.isdigit() else None
-
-
-def _find_latest_global_round(publish_root: Path) -> int:
-    global_dir = publish_root / "global"
-    if not global_dir.exists():
-        return 0
-    rounds: List[int] = []
-    for p in global_dir.glob("round_*"):
-        rn = _parse_round_num(p, "round_")
-        if rn is not None:
-            rounds.append(rn)
-    return max(rounds) if rounds else 0
-
-
-def _atomic_torch_save(obj: Dict[str, torch.Tensor], dest_path: Path):
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{dest_path.name}.tmp.", dir=str(dest_path.parent))
-    os.close(tmp_fd)
-    Path(tmp_name).unlink(missing_ok=True)
-    tmp_path = Path(tmp_name)
-    try:
-        torch.save(obj, str(tmp_path))
-        tmp_path.replace(dest_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
-def _atomic_write_text(text: str, dest_path: Path, encoding: str = "utf-8"):
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{dest_path.name}.tmp.", dir=str(dest_path.parent))
-    os.close(tmp_fd)
-    tmp_path = Path(tmp_name)
-    try:
-        tmp_path.write_text(text, encoding=encoding)
-        tmp_path.replace(dest_path)
-    except Exception:
-        tmp_path.unlink(missing_ok=True)
-        raise
-
-
-def _atomic_write_json(obj: Dict, dest_path: Path):
-    text = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    _atomic_write_text(text, dest_path)
-
-
-def _read_json(path: Path) -> Optional[Dict]:
-    if not path.exists():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return None
 
 
 def sanitize_query(q: str, max_len: int = 96) -> str:
@@ -211,14 +86,6 @@ def sanitize_query(q: str, max_len: int = 96) -> str:
     if len(q) > max_len:
         q = q[:max_len].rstrip()
     return q
-
-
-def _read_latest_global_meta(publish_root: Path, latest_round: int) -> Dict:
-    if latest_round <= 0:
-        return {}
-    meta_path = publish_root / "global" / f"round_{latest_round}" / "META.json"
-    meta = _read_json(meta_path)
-    return meta or {}
 
 
 def _sum_all_ranks_int(value: int) -> int:
@@ -236,128 +103,55 @@ def _sum_all_ranks_int(value: int) -> int:
     return int(t.item())
 
 
-def _average_adapter_states(paths: List[Path], decay_factor: float = 0.98) -> Dict[str, torch.Tensor]:
-    summed: Dict[str, torch.Tensor] = {}
-    count = 0
-    for p in paths:
-        state = torch.load(str(p), map_location="cpu")
-        if not summed:
-            summed = {k: v.float().clone() for k, v in state.items()}
-        else:
-            if set(state.keys()) != set(summed.keys()):
-                raise RuntimeError("Adapter key mismatch during sync aggregation")
-            for k, v in state.items():
-                summed[k].add_(v.float())
-        count += 1
-
-    if count == 0:
-        raise RuntimeError("No adapter states found to aggregate")
-
-    for k in summed:
-        summed[k].div_(float(count)).mul_(decay_factor)
-    return summed
+def _write_trace(trace_logger: JsonlLogger, record: StepTraceRecord):
+    trace_logger.write(record.to_dict())
 
 
-def _cleanup_after_sync(staging_root: Path, publish_root: Path, rank: int, keep_global: int = 2):
-    worker_stage_dir = staging_root / f"worker_{rank}"
-    if worker_stage_dir.exists():
-        for child in worker_stage_dir.iterdir():
-            if child.is_dir() and (child.name.startswith("ep") or child.name.startswith("sync_round_")):
-                shutil.rmtree(child, ignore_errors=True)
-
-    if rank == 0:
-        global_dir = publish_root / "global"
-        if global_dir.exists():
-            rounds: List[Tuple[int, Path]] = []
-            for p in global_dir.glob("round_*"):
-                rn = _parse_round_num(p, "round_")
-                if rn is not None:
-                    rounds.append((rn, p))
-            rounds.sort(key=lambda x: x[0])
-            if len(rounds) > keep_global:
-                for _, p in rounds[: len(rounds) - keep_global]:
-                    shutil.rmtree(p, ignore_errors=True)
-
-
-def _maybe_init_dist(ctx: WorkerContext):
-    if ctx.world_size <= 1:
-        return
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(
-        backend=backend,
-        init_method=f"file://{ctx.dist_init_file}",
-        rank=ctx.rank,
-        world_size=ctx.world_size,
+def _finalize_episode(
+    eval_logger: JsonlLogger,
+    episode_id: str,
+    pred: str,
+    gold: str,
+    step_count: int,
+    search_count: int,
+    updates: int,
+    forced_terminate: bool,
+    global_round: int,
+    inference_mode: str,
+):
+    em, f1 = em_f1(pred, gold)
+    eval_logger.write(
+        {
+            "episode_id": episode_id,
+            "pred_answer": pred,
+            "gold_answer": gold,
+            "em": em,
+            "f1": f1,
+            "steps": step_count,
+            "searches": search_count,
+            "updates": updates,
+            "forced_terminate": forced_terminate,
+            "global_round": global_round,
+            "inference_mode": inference_mode,
+        }
     )
+    eval_logger.flush()
 
 
-def _finalize_dist(ctx: WorkerContext):
-    if ctx.world_size > 1 and dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def _maybe_write_global_pointer(config: RunConfig, adapter_dir: Path, round_id: int, source: str = "global"):
-    payload = {
-        "source": source,
-        "round": int(round_id),
-        "adapter_dir": str(adapter_dir),
-        "updated_at_unix": int(time.time()),
-    }
-    _atomic_write_json(payload, config.adapter_pointer_path)
-
-
-def _build_generation_backend(config: RunConfig):
-    if config.uses_centralized_inference():
-        return InferenceClient(
-            host=config.inference_host,
-            port=config.inference_port,
-            timeout=600,
-        )
-
-    return VLLMEngine(
-        VLLMConfig(
-            model=config.model,
-            temperature=config.temperature,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            tensor_parallel_size=config.tensor_parallel_size,
-            max_model_len=config.max_model_len,
-            dtype=config.dtype,
-            max_loras=config.max_loras,
-            max_lora_rank=config.max_lora_rank,
-        )
+def _write_periodic_summary(out_dir: Path, gpu_tag: str, config: RunConfig, global_round: int):
+    eval_records = read_jsonl(out_dir / f"eval_results.{gpu_tag}.jsonl")
+    summary = summarize(
+        eval_records,
+        {
+            "gpu_tag": gpu_tag,
+            "avg_steps": sum(r.get("steps", 0) for r in eval_records) / max(1, len(eval_records)),
+            "avg_searches": sum(r.get("searches", 0) for r in eval_records) / max(1, len(eval_records)),
+            "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0) / max(1, len(eval_records)),
+            "args": config.to_dict(),
+            "global_round": global_round,
+        },
     )
-
-
-def _build_injector(config: RunConfig, out_dir: Path, ctx: WorkerContext) -> Optional[MemInjectorNTP]:
-    if not config.train_mem:
-        return None
-
-    train_device_map = None
-    if config.train_backend.lower() == "qlora":
-        train_device_map = "auto"
-    elif config.train_gpus:
-        train_device_map = "cuda"
-    else:
-        train_device_map = "cuda" if torch.cuda.is_available() else "cpu"
-
-    return MemInjectorNTP(
-        MemConfig(
-            base_model=config.model,
-            cache_dir=str(out_dir / f"cache_{ctx.gpu_tag}"),
-            mem_steps=config.mem_steps,
-            mem_lr=config.mem_lr,
-            mem_r=config.mem_r,
-            mem_alpha=config.mem_alpha,
-            mem_dropout=config.mem_dropout,
-            mem_max_tokens=config.mem_max_tokens,
-            train_backend=config.train_backend,
-            quantize_4bit=config.quantize_4bit,
-            mem_target_mode=config.mem_target_mode,
-            mem_train_router=config.mem_train_router,
-            device_map=train_device_map,
-            torch_dtype=config.dtype,
-        )
-    )
+    write_summary(str(out_dir / f"summary.{gpu_tag}.json"), summary)
 
 
 def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
@@ -367,7 +161,6 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
     adapter_root = config.adapter_root_path
     staging_root = config.adapter_staging_path
     publish_root = config.adapter_publish_path
-
     adapter_root.mkdir(parents=True, exist_ok=True)
     staging_root.mkdir(parents=True, exist_ok=True)
     publish_root.mkdir(parents=True, exist_ok=True)
@@ -375,120 +168,18 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
     trace_logger = JsonlLogger(str(out_dir / f"episode_trace.{ctx.gpu_tag}.jsonl"))
     eval_logger = JsonlLogger(str(out_dir / f"eval_results.{ctx.gpu_tag}.jsonl"))
 
-    _maybe_init_dist(ctx)
+    maybe_init_dist(ctx.world_size, ctx.rank, ctx.dist_init_file)
 
-    gen_backend = _build_generation_backend(config)
-    injector = _build_injector(config, out_dir, ctx)
-
-    global_round = _find_latest_global_round(publish_root)
-    latest_meta = _read_latest_global_meta(publish_root, global_round)
-    global_completed_offset = int(latest_meta.get("global_completed", 0)) if latest_meta else 0
-
-    if injector is not None and global_round > 0:
-        injector.load_adapter(str(publish_root / "global" / f"round_{global_round}"))
-
-    local_completed_episodes = 0
-    sync_round = global_round
-    next_sync_at = config.sync_every_episodes * (sync_round + 1)
-
-    local_version_id = 0
-    local_dirty_since_sync = False
-
-    def _local_stage_dir(episode_id: str, version_id: int) -> Path:
-        return staging_root / f"worker_{ctx.rank}" / f"ep{episode_id}" / f"v{version_id}"
-
-    def _sync_state_dir(target_round: int) -> Path:
-        return staging_root / f"worker_{ctx.rank}" / f"sync_round_{target_round}"
-
-    def _published_global_round_dir(round_id: int) -> Path:
-        return publish_root / "global" / f"round_{round_id}"
-
-    def current_adapter_ref(use_local: bool, episode_id: str) -> Optional[AdapterRef]:
-        if injector is None:
-            return None
-
-        if use_local and local_version_id > 0:
-            p = _local_stage_dir(episode_id, local_version_id)
-            if (p / "adapter_config.json").exists():
-                return AdapterRef(
-                    name=f"local_rank{ctx.rank}_ep{episode_id}",
-                    int_id=200000 + local_version_id,
-                    path=str(p),
-                )
-
-        p = _published_global_round_dir(global_round)
-        if global_round > 0 and (p / "adapter_config.json").exists():
-            return AdapterRef(
-                name="global",
-                int_id=100000 + global_round,
-                path=str(p),
-            )
-
-        return None
-
-    def _compute_global_completed_total() -> int:
-        if ctx.world_size > 1:
-            since_start = _sum_all_ranks_int(local_completed_episodes)
-        else:
-            since_start = local_completed_episodes
-        return global_completed_offset + since_start
-
-    def run_sync_if_needed(force: bool = False):
-        nonlocal sync_round, next_sync_at, global_round, local_dirty_since_sync
-
-        if injector is None or config.sync_every_episodes <= 0:
-            return
-
-        global_completed_total = _compute_global_completed_total()
-        if not force and global_completed_total < next_sync_at:
-            return
-
-        target_round = sync_round + 1
-
-        local_sync_dir = _sync_state_dir(target_round)
-        state_path = local_sync_dir / "adapter_state.pt"
-        local_state = injector.get_adapter_state_dict()
-        _atomic_torch_save(local_state, state_path)
-
-        if ctx.world_size > 1:
-            dist.barrier()
-
-        global_round_dir = _published_global_round_dir(target_round)
-        done_marker = global_round_dir / "DONE"
-        meta_path = global_round_dir / "META.json"
-
-        if ctx.rank == 0:
-            paths = [
-                staging_root / f"worker_{r}" / f"sync_round_{target_round}" / "adapter_state.pt"
-                for r in range(ctx.world_size)
-            ]
-            avg_state = _average_adapter_states(paths)
-            meta = {
-                "round": target_round,
-                "global_completed": global_completed_total,
-                "sync_every_episodes": config.sync_every_episodes,
-                "world_size": ctx.world_size,
-                "created_at_unix": int(time.time()),
-                "source_states": [str(p) for p in paths],
-            }
-            injector.save_avg_adapter_dir_atomic(avg_state, str(global_round_dir), meta)
-            _maybe_write_global_pointer(config, global_round_dir, target_round, source="global")
-
-        if ctx.world_size > 1:
-            dist.barrier()
-
-        if not done_marker.exists():
-            raise RuntimeError(f"Global adapter round missing DONE marker: {done_marker}")
-        if not meta_path.exists():
-            raise RuntimeError(f"Global adapter round missing META.json: {meta_path}")
-
-        injector.load_adapter(str(global_round_dir))
-        global_round = target_round
-        sync_round = target_round
-        next_sync_at = config.sync_every_episodes * (sync_round + 1)
-        local_dirty_since_sync = False
-
-        _cleanup_after_sync(staging_root, publish_root, ctx.rank, keep_global=2)
+    generation_service = build_generation_service(config)
+    memory_service = build_memory_service(config, out_dir, ctx.gpu_tag)
+    runtime = AdapterRuntime(
+        config=config,
+        rank=ctx.rank,
+        world_size=ctx.world_size,
+        publish_root=publish_root,
+        staging_root=staging_root,
+        memory_service=memory_service,
+    )
 
     if ctx.world_size > 1:
         device = f"cuda:{ctx.rank % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu"
@@ -504,7 +195,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
     try:
         for ex in examples:
             if ex is None:
-                run_sync_if_needed(force=False)
+                runtime.run_sync_if_needed(force=False)
                 continue
 
             episode_id = _episode_key(ex)
@@ -527,7 +218,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                 step_count += 1
                 t0 = time.time()
 
-                adapter_ref = current_adapter_ref(use_local_inference, episode_id)
+                adapter_ref = runtime.current_adapter_ref(use_local_inference, episode_id)
 
                 if step_id == 0:
                     action_type = "search"
@@ -536,60 +227,63 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                     info_block = ""
                     paras = []
                 else:
-                    prompt = build_state_prompt(question, history)
-                    raw = gen_backend.generate(
-                        prompt,
-                        max_tokens=64,
-                        temperature=0.0,
-                        adapter=adapter_ref,
-                        stop=["</search>", "<finish/>", "</finish>"],
-                    )
-
-                    raw = (raw or "").strip()
-                    if raw.startswith("<search>") and not raw.endswith("</search>"):
-                        raw += "</search>"
-
+                    raw = generation_service.generate_action(question, history, adapter_ref)
                     parsed = parse_first_action(raw)
                     action_type = parsed.action_type
                     forced_terminate = forced_terminate or parsed.forced_terminate
 
-                    if action_type == "finish":
-                        answer_prompt = build_final_answer_prompt(question, history)
-                        answer_raw = gen_backend.generate(
-                            answer_prompt,
-                            max_tokens=64,
-                            temperature=0.0,
-                            adapter=adapter_ref,
-                            stop=["</answer>"],
+                    if parsed.forced_terminate:
+                        pred = "unknown"
+                        _write_trace(
+                            trace_logger,
+                            StepTraceRecord(
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                raw_model_output=raw,
+                                action_type="finish",
+                                search_query=None,
+                                information=None,
+                                snippet=None,
+                                mem_updated=False,
+                                mem_loss=None,
+                                time_gen=time.time() - t0,
+                                time_update=0.0,
+                                forced_terminate=True,
+                                global_round=runtime.global_round,
+                                local_version_id=runtime.local_version_id,
+                                adapter_path=adapter_ref.path if adapter_ref else None,
+                                inference_mode=generation_service.inference_mode,
+                            ),
                         )
-                        answer_raw = (answer_raw or "").strip()
-                        if answer_raw.startswith("<answer>") and not answer_raw.endswith("</answer>"):
-                            answer_raw += "</answer>"
+                        break
 
+                    if action_type == "finish":
+                        answer_raw = generation_service.generate_final_answer(question, history, adapter_ref)
                         answer_parsed = parse_final_answer(answer_raw)
                         pred = (answer_parsed.content or "").strip() or "unknown"
                         forced_terminate = forced_terminate or answer_parsed.forced_terminate
 
-                        trace_logger.write(
-                            {
-                                "episode_id": episode_id,
-                                "step_id": step_id,
-                                "raw_model_output": raw,
-                                "final_answer_raw_model_output": answer_raw,
-                                "action_type": "finish",
-                                "search_query": None,
-                                "information": None,
-                                "snippet": None,
-                                "mem_updated": False,
-                                "mem_loss": None,
-                                "time_gen": time.time() - t0,
-                                "time_update": 0.0,
-                                "forced_terminate": forced_terminate,
-                                "global_round": global_round,
-                                "local_version_id": local_version_id,
-                                "adapter_path": adapter_ref.path if adapter_ref else None,
-                                "inference_mode": "remote" if config.uses_centralized_inference() else "local",
-                            }
+                        _write_trace(
+                            trace_logger,
+                            StepTraceRecord(
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                raw_model_output=raw,
+                                final_answer_raw_model_output=answer_raw,
+                                action_type="finish",
+                                search_query=None,
+                                information=None,
+                                snippet=None,
+                                mem_updated=False,
+                                mem_loss=None,
+                                time_gen=time.time() - t0,
+                                time_update=0.0,
+                                forced_terminate=forced_terminate,
+                                global_round=runtime.global_round,
+                                local_version_id=runtime.local_version_id,
+                                adapter_path=adapter_ref.path if adapter_ref else None,
+                                inference_mode=generation_service.inference_mode,
+                            ),
                         )
                         break
 
@@ -634,122 +328,85 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                 mem_loss = None
                 t_update = 0.0
 
-                if injector is not None and action_type == "search":
+                if memory_service.enabled and action_type == "search":
                     tu = time.time()
-                    snippet = injector.compress_snippet(
-                        gen_backend,
-                        question,
-                        info_block,
-                        paras[0] if paras else "",
-                        lora_name=adapter_ref.name if adapter_ref else None,
-                        lora_int_id=adapter_ref.int_id if adapter_ref else None,
-                        lora_path=adapter_ref.path if adapter_ref else None,
+                    next_local_save_dir = runtime.local_stage_dir(episode_id, runtime.local_version_id + 1)
+                    mem_updated, snippet, mem_loss = memory_service.maybe_update(
+                        gen_backend=generation_service.backend,
+                        question=question,
+                        info_block=info_block,
+                        top1_paragraph=paras[0] if paras else "",
+                        adapter_ref=adapter_ref,
+                        save_dir=next_local_save_dir,
                     )
-                    if injector.should_update(question, snippet):
-                        ok, mem_loss = injector.train_adapter(snippet)
-                        if ok:
-                            local_version_id += 1
-                            local_dir = _local_stage_dir(episode_id, local_version_id)
-                            injector.save_adapter_atomic(str(local_dir))
-                            mem_updated = True
-                            updates += 1
-                            use_local_inference = True
-                            local_dirty_since_sync = True
+                    if mem_updated:
+                        runtime.mark_local_update()
+                        updates += 1
+                        use_local_inference = True
                     t_update = time.time() - tu
 
-                trace_logger.write(
-                    {
-                        "episode_id": episode_id,
-                        "step_id": step_id,
-                        "raw_model_output": raw,
-                        "action_type": "search",
-                        "search_query": query,
-                        "information": info_block,
-                        "snippet": snippet,
-                        "mem_updated": mem_updated,
-                        "mem_loss": mem_loss,
-                        "time_gen": time.time() - t0,
-                        "time_update": t_update,
-                        "forced_terminate": forced_terminate,
-                        "global_round": global_round,
-                        "local_version_id": local_version_id,
-                        "adapter_path": adapter_ref.path if adapter_ref else None,
-                        "inference_mode": "remote" if config.uses_centralized_inference() else "local",
-                    }
+                _write_trace(
+                    trace_logger,
+                    StepTraceRecord(
+                        episode_id=episode_id,
+                        step_id=step_id,
+                        raw_model_output=raw,
+                        action_type="search",
+                        search_query=query,
+                        information=info_block,
+                        snippet=snippet,
+                        mem_updated=mem_updated,
+                        mem_loss=mem_loss,
+                        time_gen=time.time() - t0,
+                        time_update=t_update,
+                        forced_terminate=forced_terminate,
+                        global_round=runtime.global_round,
+                        local_version_id=runtime.local_version_id,
+                        adapter_path=adapter_ref.path if adapter_ref else None,
+                        inference_mode=generation_service.inference_mode,
+                    ),
                 )
+
             else:
                 forced_terminate = True
                 pred = "unknown"
 
-            em, f1 = em_f1(pred, gold)
-            eval_logger.write(
-                {
-                    "episode_id": episode_id,
-                    "pred_answer": pred,
-                    "gold_answer": gold,
-                    "em": em,
-                    "f1": f1,
-                    "steps": step_count,
-                    "searches": search_count,
-                    "updates": updates,
-                    "forced_terminate": forced_terminate,
-                    "global_round": global_round,
-                    "inference_mode": "remote" if config.uses_centralized_inference() else "local",
-                }
+            _finalize_episode(
+                eval_logger=eval_logger,
+                episode_id=episode_id,
+                pred=pred,
+                gold=gold,
+                step_count=step_count,
+                search_count=search_count,
+                updates=updates,
+                forced_terminate=forced_terminate,
+                global_round=runtime.global_round,
+                inference_mode=generation_service.inference_mode,
             )
-            eval_logger.flush()
             trace_logger.flush()
 
-            local_completed_episodes += 1
-            run_sync_if_needed(force=False)
+            runtime.increment_completed_episode()
+            runtime.run_sync_if_needed(force=False)
 
             completed += 1
             if completed % 10 == 0:
-                eval_records = read_jsonl(out_dir / f"eval_results.{ctx.gpu_tag}.jsonl")
-                summary = summarize(
-                    eval_records,
-                    {
-                        "gpu_tag": ctx.gpu_tag,
-                        "avg_steps": sum(r.get("steps", 0) for r in eval_records) / max(1, len(eval_records)),
-                        "avg_searches": sum(r.get("searches", 0) for r in eval_records) / max(1, len(eval_records)),
-                        "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0)
-                        / max(1, len(eval_records)),
-                        "args": config.to_dict(),
-                        "global_round": global_round,
-                    },
-                )
-                write_summary(str(out_dir / f"summary.{ctx.gpu_tag}.json"), summary)
+                _write_periodic_summary(out_dir, ctx.gpu_tag, config, runtime.global_round)
 
-        if injector is not None and config.sync_every_episodes > 0:
-            dirty = 1 if local_dirty_since_sync else 0
+        if memory_service.enabled and config.sync_every_episodes > 0:
+            dirty = 1 if runtime.local_dirty_since_sync else 0
             global_dirty = _sum_all_ranks_int(dirty) if ctx.world_size > 1 else dirty
             if global_dirty > 0:
-                run_sync_if_needed(force=True)
+                runtime.run_sync_if_needed(force=True)
 
-        if injector is not None and config.sync_every_episodes > 0 and ctx.rank == 0:
-            final_round_dir = _published_global_round_dir(global_round)
+        if memory_service.enabled and config.sync_every_episodes > 0 and ctx.rank == 0:
+            final_round_dir = runtime.published_global_round_dir(runtime.global_round)
             if final_round_dir.exists():
-                injector.merge_and_save_final(str(final_round_dir), str(out_dir / "final_merged_model"))
+                memory_service.merge_and_save_final(str(final_round_dir), str(out_dir / "final_merged_model"))
 
-        eval_records = read_jsonl(out_dir / f"eval_results.{ctx.gpu_tag}.jsonl")
-        summary = summarize(
-            eval_records,
-            {
-                "gpu_tag": ctx.gpu_tag,
-                "avg_steps": sum(r.get("steps", 0) for r in eval_records) / max(1, len(eval_records)),
-                "avg_searches": sum(r.get("searches", 0) for r in eval_records) / max(1, len(eval_records)),
-                "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0) / max(1, len(eval_records)),
-                "args": config.to_dict(),
-                "global_round": global_round,
-            },
-        )
-        write_summary(str(out_dir / f"summary.{ctx.gpu_tag}.json"), summary)
+        _write_periodic_summary(out_dir, ctx.gpu_tag, config, runtime.global_round)
 
     finally:
         trace_logger.close()
         eval_logger.close()
-        try:
-            gen_backend.shutdown()
-        except Exception:
-            pass
-        _finalize_dist(ctx)
+        generation_service.shutdown()
+        finalize_dist(ctx.world_size)
